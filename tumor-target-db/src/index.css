@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@layer base {
+  :root {
+    --radius: 0.5rem;
+  }
+  
+  * {
+    box-sizing: border-box;
+  }
+  
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+
+
+img {
+  object-position: top;
+}
+
+.fixed {
+  position: fixed;
+}
+
+/* Hide external watermark */
+[class*="minimax"], [id*="minimax"], 
+[class*="MiniMax"], [id*="MiniMax"],
+div[style*="z-index: 2147483647"],
+div[style*="position: fixed"][style*="bottom"] > a[href*="minimax"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+}
