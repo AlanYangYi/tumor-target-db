@@ -100,6 +100,103 @@ function EChart({ option, height = 350 }: { option: echarts.EChartsOption; heigh
   return <div ref={chartRef} style={{ width: '100%', height }} />;
 }
 
+// Volcano Chart with dispatchAction highlighting (no re-render)
+interface VolcanoDataItem {
+  value: [number, number];
+  name: string;
+  cancer: string;
+  pvalAdj: string;
+  baseColor: string;
+}
+
+function VolcanoChart({ data, highlightGene, onGeneClick, height = 300 }: { 
+  data: VolcanoDataItem[]; 
+  highlightGene: string;
+  onGeneClick: (gene: string) => void;
+  height?: number;
+}) {
+  const chartRef = useRef<HTMLDivElement>(null);
+  const chartInstance = useRef<echarts.ECharts | null>(null);
+  const geneIndexMap = useRef<Map<string, number[]>>(new Map());
+  const prevHighlight = useRef<string>('');
+
+  // Initialize chart once with all data
+  useEffect(() => {
+    if (!chartRef.current || data.length === 0) return;
+    
+    // Build gene -> indices map
+    const indexMap = new Map<string, number[]>();
+    data.forEach((d, i) => {
+      const key = d.name.toUpperCase();
+      if (!indexMap.has(key)) indexMap.set(key, []);
+      indexMap.get(key)!.push(i);
+    });
+    geneIndexMap.current = indexMap;
+
+    // Initialize or update chart
+    if (!chartInstance.current) {
+      chartInstance.current = echarts.init(chartRef.current);
+      chartInstance.current.on('click', (params: unknown) => {
+        const p = params as { data?: { name?: string } };
+        if (p.data?.name) onGeneClick(p.data.name);
+      });
+    }
+
+    // Set data once
+    chartInstance.current.setOption({
+      tooltip: { trigger: 'item', formatter: (p: unknown) => {
+        const params = p as { data: { name: string; value: number[]; cancer: string; pvalAdj: string } };
+        return `<b>${params.data.name}</b><br/>Cancer: ${params.data.cancer}<br/>p-value adjusted: ${params.data.pvalAdj}<br/>logFC: ${params.data.value[0].toFixed(3)}`;
+      }},
+      grid: { left: 60, right: 30, top: 20, bottom: 50 },
+      xAxis: { name: 'log2FC', nameLocation: 'center', nameGap: 30, splitLine: { lineStyle: { type: 'dashed', color: '#F1F3F5' }}},
+      yAxis: { name: '-log10(p-value)', nameLocation: 'center', nameGap: 40, splitLine: { lineStyle: { type: 'dashed', color: '#F1F3F5' }}},
+      series: [{
+        type: 'scatter',
+        symbolSize: 4,
+        data: data.map(d => ({ ...d, itemStyle: { color: d.baseColor }})),
+        emphasis: {
+          itemStyle: { color: '#FACC15', borderColor: '#000', borderWidth: 2 },
+          scale: 3
+        }
+      }]
+    }, true);
+
+    const handleResize = () => chartInstance.current?.resize();
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      chartInstance.current?.dispose();
+      chartInstance.current = null;
+    };
+  }, [data]);
+
+  // Handle highlight changes with dispatchAction (no re-render)
+  useEffect(() => {
+    if (!chartInstance.current) return;
+    const term = highlightGene.trim().toUpperCase();
+    
+    // Downplay previous highlight
+    if (prevHighlight.current) {
+      chartInstance.current.dispatchAction({ type: 'downplay', seriesIndex: 0 });
+    }
+    
+    // Highlight new matches
+    if (term && geneIndexMap.current.has(term)) {
+      const indices = geneIndexMap.current.get(term)!;
+      chartInstance.current.dispatchAction({
+        type: 'highlight',
+        seriesIndex: 0,
+        dataIndex: indices
+      });
+    }
+    
+    prevHighlight.current = term;
+  }, [highlightGene]);
+
+  return <div ref={chartRef} style={{ width: '100%', height }} />;
+}
+
 export default function App() {
   const [selectivityData, setSelectivityData] = useState<GeneSelectivity[]>([]);
   const [tumorNormalData, setTumorNormalData] = useState<TumorNormalData[]>([]);
@@ -115,7 +212,31 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchError, setSearchError] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
+  const [volcanoSearch, setVolcanoSearch] = useState('');
+  const [volcanoSearchError, setVolcanoSearchError] = useState('');
   const tableRef = useRef<HTMLTableElement>(null);
+
+  // New states for bar chart search and global search
+  const [barChartGene, setBarChartGene] = useState<string | null>(null);
+  const [barChartSearch, setBarChartSearch] = useState('');
+  const [barChartSearchError, setBarChartSearchError] = useState('');
+  const [globalSearch, setGlobalSearch] = useState('');
+  const [globalSearchResults, setGlobalSearchResults] = useState<{
+    volcano: boolean;
+    barChart: boolean;
+    table: boolean;
+  } | null>(null);
+
+  // Gene counts for sidebar stats
+  const cptacGeneCount = useMemo(() => {
+    const uniqueGenes = new Set(cptacData.map(d => d['Gene name']));
+    return uniqueGenes.size;
+  }, [cptacData]);
+
+  const ihcGeneCount = useMemo(() => {
+    const uniqueGenes = new Set(tumorNormalData.map(d => d['Gene name']));
+    return uniqueGenes.size;
+  }, [tumorNormalData]);
 
   useEffect(() => {
     Promise.all([
@@ -172,16 +293,33 @@ export default function App() {
   useEffect(() => {
     if (sortedData.length > 0 && !selectedGene) {
       setSelectedGene(sortedData[0].gene_name);
+      setBarChartGene(sortedData[0].gene_name);
     }
   }, [sortedData, selectedGene]);
+
+  // Update bar chart gene when table selection changes
+  useEffect(() => {
+    if (selectedGene) {
+      setBarChartGene(selectedGene);
+      setBarChartSearch('');
+      setBarChartSearchError('');
+    }
+  }, [selectedGene]);
 
   // Reset selectedGene and page when cancer changes
   const handleCancerChange = (cancer: string) => {
     setSelectedCancer(cancer);
     setSelectedGene(null);
+    setBarChartGene(null);
     setCurrentPage(1);
     setSearchQuery('');
     setSearchError('');
+    setVolcanoSearch('');
+    setVolcanoSearchError('');
+    setBarChartSearch('');
+    setBarChartSearchError('');
+    setGlobalSearch('');
+    setGlobalSearchResults(null);
   };
 
   const handleSearch = () => {
@@ -198,6 +336,70 @@ export default function App() {
     setSelectedGene(sortedData[index].gene_name);
   };
 
+  // Bar chart search handler
+  const handleBarChartSearch = () => {
+    if (!barChartSearch.trim()) {
+      setBarChartSearchError('');
+      return;
+    }
+    const query = barChartSearch.trim().toUpperCase();
+    const found = tumorNormalData.find(d => d['Gene name'].toUpperCase() === query);
+    if (!found) {
+      setBarChartSearchError('未搜索到该基因');
+    } else {
+      setBarChartSearchError('');
+      setBarChartGene(found['Gene name']);
+    }
+  };
+
+  // Global search handler
+  const handleGlobalSearch = () => {
+    if (!globalSearch.trim()) {
+      setGlobalSearchResults(null);
+      return;
+    }
+    const query = globalSearch.trim().toUpperCase();
+    
+    // Check volcano plot (CPTAC data)
+    const volcanoFound = filteredCptac.some(d => d['Gene name'].toUpperCase() === query);
+    
+    // Check bar chart (IHC data)
+    const barChartFound = tumorNormalData.some(d => d['Gene name'].toUpperCase() === query);
+    
+    // Check table (selectivity data)
+    const tableIndex = sortedData.findIndex(d => d.gene_name.toUpperCase() === query);
+    const tableFound = tableIndex !== -1;
+
+    setGlobalSearchResults({
+      volcano: volcanoFound,
+      barChart: barChartFound,
+      table: tableFound
+    });
+
+    // Update volcano search
+    setVolcanoSearch(volcanoFound ? query : '');
+    setVolcanoSearchError(volcanoFound ? '' : '检索不到该基因');
+
+    // Update bar chart
+    if (barChartFound) {
+      const found = tumorNormalData.find(d => d['Gene name'].toUpperCase() === query);
+      setBarChartGene(found!['Gene name']);
+      setBarChartSearchError('');
+    } else {
+      setBarChartSearchError('检索不到该基因');
+    }
+
+    // Update table
+    if (tableFound) {
+      const page = Math.floor(tableIndex / PAGE_SIZE) + 1;
+      setCurrentPage(page);
+      setSelectedGene(sortedData[tableIndex].gene_name);
+      setSearchError('');
+    } else {
+      setSearchError('检索不到该基因');
+    }
+  };
+
   const stats = useMemo(() => {
     if (filteredSelectivity.length === 0) return null;
     const maxScore = Math.max(...filteredSelectivity.map(d => Number(d.Selection_Score) || 0));
@@ -210,33 +412,42 @@ export default function App() {
       topGeneScore: topGeneScore?.gene_name || '', topGeneTumor: topGeneTumor?.gene_name || '', topGeneLogFC: topGeneLogFC?.gene_name || '' };
   }, [filteredSelectivity]);
 
-  const volcanoOption = useMemo((): echarts.EChartsOption | null => {
-    if (filteredCptac.length === 0) return null;
-    const data = filteredCptac.map(d => {
+  // Pre-process volcano data once (only when cancer filter changes)
+  const volcanoBaseData = useMemo((): VolcanoDataItem[] => {
+    return filteredCptac.map(d => {
       const pval = parseFloat(d['p-value adjusted']) || 1;
       const logFC = parseFloat(d.logFC) || 0;
       const negLogP = pval > 0 ? -Math.log10(pval) : 0;
-      let color = '#ADB5BD';
-      if (pval < 0.05 && logFC > 1) color = '#E03131';
-      else if (pval < 0.05 && logFC < -1) color = '#1098AD';
-      return { value: [logFC, negLogP], name: d['Gene name'], itemStyle: { color } };
+      let color = 'rgba(173,181,189,0.4)';
+      if (pval < 0.05 && logFC > 1) color = 'rgba(224,49,49,0.5)';
+      else if (pval < 0.05 && logFC < -1) color = 'rgba(16,152,173,0.5)';
+      return { value: [logFC, negLogP] as [number, number], name: d['Gene name'], cancer: d.Cancer, pvalAdj: d['p-value adjusted'], baseColor: color };
     });
-    return {
-      tooltip: { trigger: 'item', formatter: (p: unknown) => {
-        const params = p as { data: { name: string; value: number[] } };
-        return `<b>${params.data.name}</b><br/>logFC: ${params.data.value[0].toFixed(3)}<br/>-log10(p): ${params.data.value[1].toFixed(3)}`;
-      }},
-      grid: { left: 60, right: 30, top: 20, bottom: 50 },
-      xAxis: { name: 'log2FC', nameLocation: 'center', nameGap: 30, splitLine: { lineStyle: { type: 'dashed', color: '#F1F3F5' }}},
-      yAxis: { name: '-log10(p-value)', nameLocation: 'center', nameGap: 40, splitLine: { lineStyle: { type: 'dashed', color: '#F1F3F5' }}},
-      series: [{ type: 'scatter', symbolSize: 6, data }]
-    };
   }, [filteredCptac]);
 
-  // Grouped bar chart for all 20 cancer types
+  const handleVolcanoSearch = () => {
+    if (!volcanoSearch.trim()) {
+      setVolcanoSearchError('');
+      return;
+    }
+    const query = volcanoSearch.trim().toUpperCase();
+    const found = filteredCptac.some(d => d['Gene name'].toUpperCase() === query);
+    if (!found) {
+      setVolcanoSearchError('未找到该基因');
+    } else {
+      setVolcanoSearchError('');
+    }
+  };
+
+  const handleVolcanoClick = (geneName: string) => {
+    setVolcanoSearch(geneName);
+    setVolcanoSearchError('');
+  };
+
+  // Grouped bar chart for all 20 cancer types - now uses barChartGene
   const barOption = useMemo((): echarts.EChartsOption | null => {
-    if (!selectedGene) return null;
-    const geneData = tumorNormalData.find(d => d['Gene name'] === selectedGene);
+    if (!barChartGene) return null;
+    const geneData = tumorNormalData.find(d => d['Gene name'] === barChartGene);
     if (!geneData) return null;
     
     const tumorData: number[] = [];
@@ -287,7 +498,7 @@ export default function App() {
         }
       ]
     };
-  }, [selectedGene, tumorNormalData]);
+  }, [barChartGene, tumorNormalData]);
 
   const generateReport = async (geneName: string) => {
     setReportGene(geneName);
@@ -363,6 +574,17 @@ export default function App() {
             <h1 className="text-lg font-semibold text-neutral-900">TST Database</h1>
           </div>
           <p className="text-xs text-neutral-500 mt-1">Tumor Selective Targets</p>
+          {/* Gene counts */}
+          <div className="mt-3 space-y-2">
+            <div className="flex items-center justify-between bg-primary-50 rounded-md px-3 py-2">
+              <span className="text-xs text-primary-700">CPTAC Total Gene</span>
+              <span className="text-sm font-semibold text-primary-600">{cptacGeneCount}</span>
+            </div>
+            <div className="flex items-center justify-between bg-teal-50 rounded-md px-3 py-2">
+              <span className="text-xs text-teal-700">IHC Total Gene</span>
+              <span className="text-sm font-semibold text-teal-600">{ihcGeneCount}</span>
+            </div>
+          </div>
         </div>
         <nav className="flex-1 overflow-y-auto p-3">
           <p className="text-xs font-medium text-neutral-500 uppercase mb-2 px-2">Cancer Types</p>
@@ -385,148 +607,295 @@ export default function App() {
       </aside>
 
       {/* Main */}
-      <main className="flex-1 overflow-auto p-6">
-        <div className="flex justify-between items-center mb-6">
-          <div>
-            <h2 className="text-2xl font-semibold text-neutral-900 capitalize">{selectedCancer}</h2>
-            <p className="text-sm text-neutral-500">Gene selectivity analysis dashboard</p>
-          </div>
-          <button onClick={exportCSV} className="flex items-center gap-2 px-4 py-2 bg-primary-500 text-white rounded-md hover:bg-primary-600 transition-colors">
-            <Download className="w-4 h-4" />Export Data
-          </button>
-        </div>
-
-        {/* Stats Cards */}
-        {stats && (
-          <div className="grid grid-cols-4 gap-4 mb-6">
-            <div className="bg-white rounded-md shadow-sm p-5">
-              <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><Dna className="w-4 h-4" />Total Genes</div>
-              <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.geneCount}</div>
+      <main className="flex-1 overflow-auto flex flex-col">
+        {/* Global Search Bar */}
+        <div className="bg-white border-b border-neutral-100 px-6 py-3">
+          <div className="flex items-center gap-3">
+            <div className="relative flex-1 max-w-md">
+              <input
+                type="text"
+                value={globalSearch}
+                onChange={(e) => { setGlobalSearch(e.target.value); setGlobalSearchResults(null); }}
+                onKeyDown={(e) => e.key === 'Enter' && handleGlobalSearch()}
+                placeholder="Search Gene in all databases"
+                className="w-full pl-10 pr-4 py-2 border border-neutral-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+              />
+              <Search className="w-5 h-5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
             </div>
-            <div className="bg-white rounded-md shadow-sm p-5 group relative">
-              <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><TrendingUp className="w-4 h-4" />Max Selection Score</div>
-              <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.maxScore.toFixed(2)}</div>
-              <div className="absolute inset-0 bg-neutral-900/90 rounded-md text-white p-4 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                <span className="font-mono text-sm">{stats.topGeneScore}</span>
-              </div>
-            </div>
-            <div className="bg-white rounded-md shadow-sm p-5 group relative">
-              <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><Activity className="w-4 h-4" />Max Tumor Expression</div>
-              <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.maxTumor.toFixed(2)}</div>
-              <div className="absolute inset-0 bg-neutral-900/90 rounded-md text-white p-4 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                <span className="font-mono text-sm">{stats.topGeneTumor}</span>
-              </div>
-            </div>
-            <div className="bg-white rounded-md shadow-sm p-5 group relative">
-              <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><BarChart3 className="w-4 h-4" />Max log2FC</div>
-              <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.maxLogFC.toFixed(2)}</div>
-              <div className="absolute inset-0 bg-neutral-900/90 rounded-md text-white p-4 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                <span className="font-mono text-sm">{stats.topGeneLogFC}</span>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Volcano Plot - Full Width */}
-        {volcanoOption && (
-          <div className="bg-white rounded-md shadow-sm p-5 mb-6">
-            <h3 className="text-lg font-semibold text-neutral-900 mb-4">Volcano plot based on CPTAC dataset</h3>
-            <EChart option={volcanoOption} height={300} />
-          </div>
-        )}
-
-        {/* Grouped Bar Chart - Full Width */}
-        <div className="bg-white rounded-md shadow-sm p-5 mb-6">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-neutral-900">
-              Protein Expression data Distribution based on IHC dataset
-              {selectedGene && <span className="text-primary-500 ml-2">({selectedGene})</span>}
-            </h3>
-          </div>
-          {barOption ? <EChart option={barOption} height={280} /> : (
-            <div className="h-[280px] flex items-center justify-center text-neutral-400 text-sm">Loading...</div>
-          )}
-        </div>
-
-        {/* Data Table */}
-        <div className="bg-white rounded-md shadow-sm overflow-hidden">
-          <div className="p-4 border-b border-neutral-100 flex justify-between items-center">
-            <h3 className="text-lg font-semibold text-neutral-900">Gene Selectivity Data</h3>
-            <div className="flex items-center gap-2">
-              <div className="relative">
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => { setSearchQuery(e.target.value); setSearchError(''); }}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-                  placeholder="Search gene..."
-                  className="pl-9 pr-3 py-1.5 border border-neutral-200 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent w-48"
-                />
-                <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              </div>
-              <button onClick={handleSearch} className="px-3 py-1.5 bg-primary-500 text-white text-sm rounded-md hover:bg-primary-600">
-                Search
-              </button>
-            </div>
-          </div>
-          {searchError && (
-            <div className="px-4 py-2 bg-red-50 text-red-600 text-sm">{searchError}</div>
-          )}
-          <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
-            <table ref={tableRef} className="w-full text-sm">
-              <thead className="bg-neutral-50 sticky top-0">
-                <tr>
-                  {['gene_name', 'Selection_Score', 'max_tumor_expression', 'S_active_log2FC_max', 'active_projects', 'E_inactive_expression_max'].map(col => (
-                    <th key={col} onClick={() => handleSort(col)} className="px-4 py-3 text-left text-neutral-600 font-medium cursor-pointer hover:bg-neutral-100 select-none">
-                      <div className="flex items-center gap-1">
-                        {col === 'gene_name' ? 'Gene' : col.replace(/_/g, ' ')}
-                        {sortConfig.key === col && (sortConfig.dir === 'desc' ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />)}
-                      </div>
-                    </th>
-                  ))}
-                  <th className="px-4 py-3 text-left text-neutral-600 font-medium">Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paginatedData.map((row, i) => (
-                  <tr key={i} onClick={() => setSelectedGene(row.gene_name)} className={`border-b border-neutral-100 cursor-pointer transition-colors ${selectedGene === row.gene_name ? 'bg-primary-50' : 'hover:bg-neutral-50'}`}>
-                    <td className="px-4 py-3 font-mono font-medium text-primary-600">{row.gene_name}</td>
-                    <td className="px-4 py-3 tabular-nums">{Number(row.Selection_Score).toFixed(4)}</td>
-                    <td className="px-4 py-3 tabular-nums">{Number(row.max_tumor_expression).toFixed(4)}</td>
-                    <td className="px-4 py-3 tabular-nums">{Number(row.S_active_log2FC_max).toFixed(4)}</td>
-                    <td className="px-4 py-3 text-xs max-w-[200px] truncate" title={String(row.active_projects)}>{row.active_projects}</td>
-                    <td className="px-4 py-3 tabular-nums">{Number(row.E_inactive_expression_max).toFixed(4)}</td>
-                    <td className="px-4 py-3">
-                      <button onClick={(e) => { e.stopPropagation(); generateReport(row.gene_name); }} className="text-primary-500 hover:text-primary-600 text-xs font-medium">Report</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {/* Pagination */}
-          <div className="px-4 py-3 border-t border-neutral-100 flex items-center justify-between">
-            <div className="text-sm text-neutral-500">
-              Showing {((currentPage - 1) * PAGE_SIZE) + 1} - {Math.min(currentPage * PAGE_SIZE, sortedData.length)} of {sortedData.length} genes
-            </div>
-            <div className="flex items-center gap-2">
+            <button onClick={handleGlobalSearch} className="px-4 py-2 bg-primary-500 text-white text-sm rounded-lg hover:bg-primary-600 transition-colors">
+              Search
+            </button>
+            {globalSearch.trim() && (
               <button
-                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                disabled={currentPage === 1}
-                className="p-1.5 rounded border border-neutral-200 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                onClick={() => generateReport(globalSearch.trim())}
+                className="px-4 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 transition-colors flex items-center gap-2"
               >
-                <ChevronLeft className="w-4 h-4" />
+                <FileText className="w-4 h-4" />
+                Generate Report
               </button>
-              <span className="text-sm text-neutral-600">
-                Page {currentPage} of {totalPages}
+            )}
+            {globalSearch && (
+              <button onClick={() => { 
+                setGlobalSearch(''); 
+                setGlobalSearchResults(null);
+                setVolcanoSearch('');
+                setVolcanoSearchError('');
+                setBarChartSearchError('');
+                setSearchError('');
+              }} className="px-3 py-2 text-neutral-500 hover:text-neutral-700 text-sm">
+                Clear
+              </button>
+            )}
+          </div>
+          {globalSearchResults && (
+            <div className="mt-2 flex gap-4 text-xs">
+              <span className={globalSearchResults.volcano ? 'text-green-600' : 'text-red-500'}>
+                CPTAC dataset: {globalSearchResults.volcano ? 'found' : 'not found'}
               </span>
-              <button
-                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                disabled={currentPage === totalPages}
-                className="p-1.5 rounded border border-neutral-200 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <ChevronRight className="w-4 h-4" />
-              </button>
+              <span className={globalSearchResults.barChart ? 'text-green-600' : 'text-red-500'}>
+                IHC dataset: {globalSearchResults.barChart ? 'found' : 'not found'}
+              </span>
+              <span className={globalSearchResults.table ? 'text-green-600' : 'text-red-500'}>
+                Gene Selectivity Data: {globalSearchResults.table ? 'found' : 'not found'}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="flex-1 overflow-auto p-6">
+          <div className="flex justify-between items-center mb-6">
+            <div>
+              <h2 className="text-2xl font-semibold text-neutral-900 capitalize">{selectedCancer}</h2>
+              <p className="text-sm text-neutral-500">Gene selectivity analysis dashboard</p>
+            </div>
+            <button onClick={exportCSV} className="flex items-center gap-2 px-4 py-2 bg-primary-500 text-white rounded-md hover:bg-primary-600 transition-colors">
+              <Download className="w-4 h-4" />Export Data
+            </button>
+          </div>
+
+          {/* Stats Cards */}
+          {stats && (
+            <div className="grid grid-cols-4 gap-4 mb-6">
+              <div className="bg-white rounded-md shadow-sm p-5">
+                <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><Dna className="w-4 h-4" />Selective Total Genes</div>
+                <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.geneCount}</div>
+              </div>
+              <div className="bg-white rounded-md shadow-sm p-5 group relative">
+                <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><TrendingUp className="w-4 h-4" />Max Selection Score</div>
+                <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.maxScore.toFixed(2)}</div>
+                <div className="absolute inset-0 bg-neutral-900/90 rounded-md text-white p-4 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                  <span className="font-mono text-sm">{stats.topGeneScore}</span>
+                </div>
+              </div>
+              <div className="bg-white rounded-md shadow-sm p-5 group relative">
+                <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><Activity className="w-4 h-4" />Max Tumor Expression</div>
+                <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.maxTumor.toFixed(2)}</div>
+                <div className="absolute inset-0 bg-neutral-900/90 rounded-md text-white p-4 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                  <span className="font-mono text-sm">{stats.topGeneTumor}</span>
+                </div>
+              </div>
+              <div className="bg-white rounded-md shadow-sm p-5 group relative">
+                <div className="flex items-center gap-2 text-neutral-500 text-xs uppercase mb-2"><BarChart3 className="w-4 h-4" />Max log2FC</div>
+                <div className="text-3xl font-semibold text-neutral-900 tabular-nums">{stats.maxLogFC.toFixed(2)}</div>
+                <div className="absolute inset-0 bg-neutral-900/90 rounded-md text-white p-4 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                  <span className="font-mono text-sm">{stats.topGeneLogFC}</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Volcano Plot - Full Width */}
+          {volcanoBaseData.length > 0 && (
+            <div className="bg-white rounded-md shadow-sm p-5 mb-6">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold text-neutral-900">Volcano plot based on CPTAC dataset</h3>
+                <div className="flex items-center gap-2">
+                  <div className="relative">
+                    <input
+                      type="text"
+                      value={volcanoSearch}
+                      onChange={(e) => { setVolcanoSearch(e.target.value); setVolcanoSearchError(''); }}
+                      onKeyDown={(e) => e.key === 'Enter' && handleVolcanoSearch()}
+                      placeholder="Search gene..."
+                      className="pl-9 pr-3 py-1.5 border border-neutral-200 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent w-48"
+                    />
+                    <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  </div>
+                  <button onClick={handleVolcanoSearch} className="px-3 py-1.5 bg-primary-500 text-white text-sm rounded-md hover:bg-primary-600">
+                    Search
+                  </button>
+                  {volcanoSearch && (
+                    <button onClick={() => { setVolcanoSearch(''); setVolcanoSearchError(''); }} className="px-2 py-1.5 text-neutral-500 hover:text-neutral-700 text-sm">
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+              {volcanoSearchError && (
+                <div className="mb-2 px-3 py-1.5 bg-red-50 text-red-600 text-sm rounded">{volcanoSearchError}</div>
+              )}
+              <VolcanoChart data={volcanoBaseData} highlightGene={volcanoSearch} onGeneClick={handleVolcanoClick} height={300} />
+              
+              {/* Gene Detail Table - shows when a gene is selected */}
+              {volcanoSearch.trim() && (
+                <div className="mt-4 border-t border-neutral-100 pt-4">
+                  <h4 className="text-sm font-semibold text-neutral-700 mb-3">
+                    Gene Details: <span className="text-primary-500">{volcanoSearch}</span>
+                  </h4>
+                  {(() => {
+                    const geneData = filteredCptac.filter(d => d['Gene name'].toUpperCase() === volcanoSearch.trim().toUpperCase());
+                    if (geneData.length === 0) return <p className="text-sm text-neutral-500">No data found for this gene.</p>;
+                    return (
+                      <div className="overflow-x-auto max-h-[200px] overflow-y-auto border border-neutral-200 rounded">
+                        <table className="w-full text-sm">
+                          <thead className="bg-neutral-50 sticky top-0">
+                            <tr>
+                              <th className="px-3 py-2 text-left text-neutral-600 font-medium">Cancer</th>
+                              <th className="px-3 py-2 text-left text-neutral-600 font-medium">Gene</th>
+                              <th className="px-3 py-2 text-left text-neutral-600 font-medium">Gene name</th>
+                              <th className="px-3 py-2 text-left text-neutral-600 font-medium">p-value adjusted</th>
+                              <th className="px-3 py-2 text-left text-neutral-600 font-medium">logFC</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {geneData.map((row, i) => (
+                              <tr key={i} className="border-t border-neutral-100 hover:bg-neutral-50">
+                                <td className="px-3 py-2 capitalize">{row.Cancer}</td>
+                                <td className="px-3 py-2 font-mono text-xs">{row.Gene}</td>
+                                <td className="px-3 py-2 font-medium text-primary-600">{row['Gene name']}</td>
+                                <td className="px-3 py-2 tabular-nums">{row['p-value adjusted']}</td>
+                                <td className="px-3 py-2 tabular-nums">{row.logFC}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Grouped Bar Chart - Full Width with Search */}
+          <div className="bg-white rounded-md shadow-sm p-5 mb-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-neutral-900">
+                Protein Expression data Distribution based on IHC dataset
+                {barChartGene && <span className="text-primary-500 ml-2">({barChartGene})</span>}
+              </h3>
+              <div className="flex items-center gap-2">
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={barChartSearch}
+                    onChange={(e) => { setBarChartSearch(e.target.value); setBarChartSearchError(''); }}
+                    onKeyDown={(e) => e.key === 'Enter' && handleBarChartSearch()}
+                    placeholder="Search gene..."
+                    className="pl-9 pr-3 py-1.5 border border-neutral-200 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent w-48"
+                  />
+                  <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                </div>
+                <button onClick={handleBarChartSearch} className="px-3 py-1.5 bg-primary-500 text-white text-sm rounded-md hover:bg-primary-600">
+                  Search
+                </button>
+                {barChartSearch && (
+                  <button onClick={() => { setBarChartSearch(''); setBarChartSearchError(''); }} className="px-2 py-1.5 text-neutral-500 hover:text-neutral-700 text-sm">
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+            {barChartSearchError && (
+              <div className="mb-2 px-3 py-1.5 bg-red-50 text-red-600 text-sm rounded">{barChartSearchError}</div>
+            )}
+            {barOption ? <EChart option={barOption} height={280} /> : (
+              <div className="h-[280px] flex items-center justify-center text-neutral-400 text-sm">
+                {barChartSearchError ? '未搜索到该基因' : 'Loading...'}
+              </div>
+            )}
+          </div>
+
+          {/* Data Table */}
+          <div className="bg-white rounded-md shadow-sm overflow-hidden">
+            <div className="p-4 border-b border-neutral-100 flex justify-between items-center">
+              <h3 className="text-lg font-semibold text-neutral-900">Gene Selectivity Data</h3>
+              <div className="flex items-center gap-2">
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => { setSearchQuery(e.target.value); setSearchError(''); }}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                    placeholder="Search gene..."
+                    className="pl-9 pr-3 py-1.5 border border-neutral-200 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent w-48"
+                  />
+                  <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                </div>
+                <button onClick={handleSearch} className="px-3 py-1.5 bg-primary-500 text-white text-sm rounded-md hover:bg-primary-600">
+                  Search
+                </button>
+              </div>
+            </div>
+            {searchError && (
+              <div className="px-4 py-2 bg-red-50 text-red-600 text-sm">{searchError}</div>
+            )}
+            <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+              <table ref={tableRef} className="w-full text-sm">
+                <thead className="bg-neutral-50 sticky top-0">
+                  <tr>
+                    {['gene_name', 'Selection_Score', 'max_tumor_expression', 'S_active_log2FC_max', 'active_projects', 'E_inactive_expression_max'].map(col => (
+                      <th key={col} onClick={() => handleSort(col)} className="px-4 py-3 text-left text-neutral-600 font-medium cursor-pointer hover:bg-neutral-100 select-none">
+                        <div className="flex items-center gap-1">
+                          {col === 'gene_name' ? 'Gene' : col.replace(/_/g, ' ')}
+                          {sortConfig.key === col && (sortConfig.dir === 'desc' ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />)}
+                        </div>
+                      </th>
+                    ))}
+                    <th className="px-4 py-3 text-left text-neutral-600 font-medium">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginatedData.map((row, i) => (
+                    <tr key={i} onClick={() => { setSelectedGene(row.gene_name); setSearchError(''); }} className={`border-b border-neutral-100 cursor-pointer transition-colors ${selectedGene === row.gene_name ? 'bg-primary-50' : 'hover:bg-neutral-50'}`}>
+                      <td className="px-4 py-3 font-mono font-medium text-primary-600">{row.gene_name}</td>
+                      <td className="px-4 py-3 tabular-nums">{Number(row.Selection_Score).toFixed(4)}</td>
+                      <td className="px-4 py-3 tabular-nums">{Number(row.max_tumor_expression).toFixed(4)}</td>
+                      <td className="px-4 py-3 tabular-nums">{Number(row.S_active_log2FC_max).toFixed(4)}</td>
+                      <td className="px-4 py-3 text-xs max-w-[200px] truncate" title={String(row.active_projects)}>{row.active_projects}</td>
+                      <td className="px-4 py-3 tabular-nums">{Number(row.E_inactive_expression_max).toFixed(4)}</td>
+                      <td className="px-4 py-3">
+                        <button onClick={(e) => { e.stopPropagation(); generateReport(row.gene_name); }} className="text-primary-500 hover:text-primary-600 text-xs font-medium">Report</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {/* Pagination */}
+            <div className="px-4 py-3 border-t border-neutral-100 flex items-center justify-between">
+              <div className="text-sm text-neutral-500">
+                Showing {((currentPage - 1) * PAGE_SIZE) + 1} - {Math.min(currentPage * PAGE_SIZE, sortedData.length)} of {sortedData.length} genes
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="p-1.5 rounded border border-neutral-200 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <span className="text-sm text-neutral-600">
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="p-1.5 rounded border border-neutral-200 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
             </div>
           </div>
         </div>
